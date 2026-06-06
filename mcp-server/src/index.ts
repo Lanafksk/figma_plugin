@@ -8,6 +8,7 @@ import {
 } from '@modelcontextprotocol/sdk/types.js';
 import { WebSocketServer, WebSocket } from 'ws';
 import { randomUUID } from 'crypto';
+import { execSync } from 'child_process';
 
 const WS_PORT = parseInt(process.env.MCP_BRIDGE_PORT ?? '3055', 10);
 
@@ -38,13 +39,49 @@ const pending = new Map<
   { resolve: (data: unknown) => void; reject: (err: Error) => void; timer: ReturnType<typeof setTimeout> }
 >();
 
-const wss = new WebSocketServer({ port: WS_PORT });
+function freePort(port: number): void {
+  try {
+    const pids = execSync(`lsof -ti :${port}`, { encoding: 'utf8', stdio: ['pipe', 'pipe', 'pipe'] }).trim();
+    for (const pid of pids.split('\n').filter(Boolean)) {
+      try {
+        execSync(`kill ${pid.trim()}`);
+        log(`포트 ${port} 점유 프로세스(PID: ${pid.trim()}) 종료`);
+      } catch { /* already gone */ }
+    }
+  } catch { /* port is free */ }
+}
 
-wss.on('listening', () => {
+function createWss(port: number): Promise<WebSocketServer> {
+  return new Promise((resolve, reject) => {
+    const wss = new WebSocketServer({ port });
+    wss.once('listening', () => resolve(wss));
+    wss.once('error', async (e: NodeJS.ErrnoException) => {
+      if (e.code === 'EADDRINUSE') {
+        log(`포트 ${port} 사용 중. 기존 프로세스 종료 후 재시도...`);
+        freePort(port);
+        await new Promise(r => setTimeout(r, 300));
+        const retry = new WebSocketServer({ port });
+        retry.once('listening', () => resolve(retry));
+        retry.once('error', reject);
+      } else {
+        reject(e);
+      }
+    });
+  });
+}
+
+// placeholder — assigned in main() before MCP server starts
+let wss!: WebSocketServer;
+
+function setupWss(instance: WebSocketServer): void {
+  wss = instance;
   log(`WebSocket bridge listening on ws://localhost:${WS_PORT}`);
-});
+}
 
-wss.on('connection', (ws) => {
+// ─── connection handlers (called after wss is assigned) ───────────────────────
+
+function attachWssHandlers(): void {
+  wss.on('connection', (ws) => {
   log('Figma plugin connected');
   figmaPlugin = ws;
 
@@ -83,10 +120,11 @@ wss.on('connection', (ws) => {
     }
   });
 
-  ws.on('error', (e) => log(`Plugin WS error: ${e}`));
-});
+    ws.on('error', (e) => log(`Plugin WS error: ${e}`));
+  });
 
-wss.on('error', (e) => log(`WS server error: ${e}`));
+  wss.on('error', (e) => log(`WS server error: ${e}`));
+}
 
 function sendToFigma(type: string, payload?: Record<string, unknown>, timeoutMs = 30_000): Promise<unknown> {
   return new Promise((resolve, reject) => {
@@ -607,9 +645,15 @@ function log(msg: string) {
 }
 
 async function main() {
+  // Connect MCP stdio first so Claude Code's handshake doesn't time out
   const transport = new StdioServerTransport();
   await server.connect(transport);
   log('MCP 서버 시작됨 (stdio)');
+
+  // WebSocket setup runs after — port conflict retry won't block MCP init
+  const instance = await createWss(WS_PORT);
+  setupWss(instance);
+  attachWssHandlers();
 }
 
 main().catch((e) => {
